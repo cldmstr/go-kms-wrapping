@@ -70,6 +70,10 @@ func getOpts(opt ...wrapping.Option) (*options, error) {
 				opts.withVaultName = v
 			case "key_name":
 				opts.withKeyName = v
+			case "token_file_name":
+				opts.withTokenFileName = v
+			case "authority_host":
+				opts.withAuthorityHost = v
 			}
 		}
 	}
@@ -103,6 +107,8 @@ type options struct {
 	withResource        string
 	withVaultName       string
 	withKeyName         string
+	withTokenFileName   string
+	withAuthorityHost   string
 
 	withLogger hclog.Logger
 }
@@ -206,6 +212,26 @@ func WithLogger(with hclog.Logger) wrapping.Option {
 	return func() interface{} {
 		return OptionFunc(func(o *options) error {
 			o.withLogger = with
+			return nil
+		})
+	}
+}
+
+// WithTokenFileName provides a way to pass in the name of a federation token file
+func WithTokenFileName(with string) wrapping.Option {
+	return func() interface{} {
+		return OptionFunc(func(o *options) error {
+			o.withTokenFileName = with
+			return nil
+		})
+	}
+}
+
+// WithTokenFileName provides a way to pass in the authority host uri
+func WithAuthorityHost(with string) wrapping.Option {
+	return func() interface{} {
+		return OptionFunc(func(o *options) error {
+			o.withAuthorityHost = with
 			return nil
 		})
 	}

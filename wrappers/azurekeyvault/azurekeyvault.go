@@ -8,12 +8,14 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/services/keyvault/v7.1/keyvault"
 	"github.com/Azure/go-autorest/autorest"
 	"github.com/Azure/go-autorest/autorest/azure"
 	"github.com/Azure/go-autorest/autorest/azure/auth"
 	"github.com/Azure/go-autorest/autorest/to"
+	"github.com/AzureAD/microsoft-authentication-library-for-go/apps/confidential"
 	"github.com/hashicorp/go-hclog"
 	wrapping "github.com/hashicorp/go-kms-wrapping/v2"
 )
@@ -32,11 +34,13 @@ const (
 // and AES key and wrap the key using Key Vault and store it with the
 // data
 type Wrapper struct {
-	tenantID     string
-	clientID     string
-	clientSecret string
-	vaultName    string
-	keyName      string
+	tenantID      string
+	clientID      string
+	clientSecret  string
+	tokenFileName string
+	authorityHost string
+	vaultName     string
+	keyName       string
 
 	currentKeyId *atomic.Value
 
@@ -95,6 +99,20 @@ func (v *Wrapper) SetConfig(_ context.Context, opt ...wrapping.Option) (*wrappin
 		v.clientSecret = os.Getenv("AZURE_CLIENT_SECRET")
 	case opts.withClientSecret != "":
 		v.clientSecret = opts.withClientSecret
+	}
+
+	switch {
+	case os.Getenv("AZURE_FEDERATED_TOKEN_FILE") != "" && !opts.withDisallowEnvVars:
+		v.tokenFileName = os.Getenv("AZURE_FEDERATED_TOKEN_FILE")
+	case opts.withClientSecret != "":
+		v.tokenFileName = opts.withTokenFileName
+	}
+
+	switch {
+	case os.Getenv("AZURE_AUTHORITY_HOST") != "" && !opts.withDisallowEnvVars:
+		v.authorityHost = os.Getenv("AZURE_AUTHORITY_HOST")
+	case opts.withClientSecret != "":
+		v.authorityHost = opts.withAuthorityHost
 	}
 
 	var envName string
@@ -305,6 +323,35 @@ func (v *Wrapper) getKeyVaultClient() (*keyvault.BaseClient, error) {
 		if err != nil {
 			return nil, err
 		}
+	// Use federated token request when available
+	case v.tokenFileName != "" && v.authorityHost != "" && v.clientID != "" && v.tenantID != "":
+		cred := confidential.NewCredFromAssertionCallback(func(context.Context, confidential.AssertionRequestOptions) (string, error) {
+			return readJWTFromFS(v.tokenFileName)
+		})
+		// create the confidential client to request an AAD token
+		confidentialClientApp, err := confidential.New(
+			v.clientID,
+			cred,
+			confidential.WithAuthority(fmt.Sprintf("%s%s/oauth2/token", v.authorityHost, v.tenantID)))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create confidential client app %w", err)
+		}
+
+		resource := strings.TrimSuffix(v.resource, "/")
+		if !strings.HasSuffix(resource, ".default") {
+			resource += "/.default"
+		}
+		token, err := confidentialClientApp.AcquireTokenByCredential(context.Background(), []string{resource})
+		if err != nil {
+			return nil, fmt.Errorf("failed to acquire token %w", err)
+		}
+
+		authorizer = autorest.NewBearerAuthorizer(authResult{
+			accessToken:    token.AccessToken,
+			expiresOn:      token.ExpiresOn,
+			grantedScopes:  token.GrantedScopes,
+			declinedScopes: token.DeclinedScopes,
+		})
 	// By default use MSI
 	default:
 		config := auth.NewMSIConfig()
@@ -321,6 +368,29 @@ func (v *Wrapper) getKeyVaultClient() (*keyvault.BaseClient, error) {
 	client := keyvault.New()
 	client.Authorizer = authorizer
 	return &client, nil
+}
+
+// authResult contains the subset of results from token acquisition operation in ConfidentialClientApplication
+// For details see https://aka.ms/msal-net-authenticationresult
+type authResult struct {
+	accessToken    string
+	expiresOn      time.Time
+	grantedScopes  []string
+	declinedScopes []string
+}
+
+// OAuthToken implements the OAuthTokenProvider interface.  It returns the current access token.
+func (ar authResult) OAuthToken() string {
+	return ar.accessToken
+}
+
+// readJWTFromFS reads the jwt from file system
+func readJWTFromFS(tokenFilePath string) (string, error) {
+	token, err := os.ReadFile(tokenFilePath)
+	if err != nil {
+		return "", err
+	}
+	return string(token), nil
 }
 
 // Client returns the AzureKeyVault client used by the wrapper.
